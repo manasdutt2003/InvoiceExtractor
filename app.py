@@ -1,110 +1,135 @@
-import os
-from dotenv import load_dotenv
-from PIL import Image
-import streamlit as st
-import google.generativeai as genai
+"""Ask questions about an invoice image, or extract its fields as JSON,
+using Google Gemini's multimodal model."""
+
+from __future__ import annotations
+
 import json
+import os
 
-# ========================================
-# Load API key
-# ========================================
+import google.generativeai as genai
+import streamlit as st
+from dotenv import load_dotenv
+
 load_dotenv()
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# ========================================
-# Initialize Gemini 2.5 Flash (multimodal)
-# ========================================
-model = genai.GenerativeModel("gemini-2.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# ========================================
-# Helper: ask Gemini about an image
-# ========================================
-def get_gemini_response(image_path, question):
-    """
-    Send image + question to Gemini and safely return text output or JSON.
-    """
-    with open(image_path, "rb") as img_file:
-        image_bytes = img_file.read()
+EXTRACTION_PROMPT = """Extract the fields below from this invoice and return
+one JSON object with exactly these keys. Use null for anything that is not
+visible on the invoice. Amounts must be numbers without currency symbols.
+
+- invoice_number
+- invoice_date (YYYY-MM-DD when the date is unambiguous)
+- due_date
+- vendor_name
+- vendor_address
+- customer_name
+- currency (ISO code if it can be inferred)
+- subtotal
+- tax_amount
+- total_amount
+- line_items: list of {description, quantity, unit_price, amount}
+"""
+
+st.set_page_config(page_title="Invoice Extractor", page_icon="📄", layout="centered")
+
+
+def get_api_key() -> str | None:
+    try:
+        if "GOOGLE_API_KEY" in st.secrets:
+            return st.secrets["GOOGLE_API_KEY"]
+    except Exception:
+        pass  # no secrets.toml: normal for local runs
+    return os.getenv("GOOGLE_API_KEY")
+
+
+@st.cache_resource
+def get_model(api_key: str):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(MODEL_NAME)
+
+
+def ask_gemini(model, image_bytes: bytes, mime_type: str, prompt: str, as_json: bool) -> str:
+    """Send the invoice and prompt to Gemini and return the text reply."""
+    config = {"max_output_tokens": 4096, "temperature": 0}
+    if as_json:
+        # Ask the API for JSON directly instead of parsing it out of prose.
+        config["response_mime_type"] = "application/json"
 
     response = model.generate_content(
-        [question, {"mime_type": "image/jpeg", "data": image_bytes}],
-        generation_config={"max_output_tokens": 1024},
+        [prompt, {"mime_type": mime_type, "data": image_bytes}],
+        generation_config=config,
     )
+    try:
+        return response.text.strip()
+    except ValueError:
+        # response.text raises when the reply was blocked or came back empty.
+        reason = getattr(response, "prompt_feedback", None)
+        raise RuntimeError(f"Gemini returned no text. {reason or ''}".strip())
 
-    if response.candidates:
-        content = response.candidates[0].content  # single Content object
-        if hasattr(content, "text") and content.text:
-            text = content.text.strip()
-            # Try parsing JSON if possible
-            try:
-                return json.loads(text)
-            except:
-                return text
 
-    return "⚠️ No valid text returned. Try a simpler question."
+st.title("📄 Invoice Extractor")
+st.caption(f"Upload an invoice and ask about it. Powered by {MODEL_NAME}.")
 
-# ========================================
-# Streamlit UI
-# ========================================
-st.set_page_config(page_title="Invoice Extractor", page_icon="📄", layout="centered")
-st.title("📄 Invoice Extractor using Google Gemini 2.5 Flash")
-st.caption("Upload an invoice and ask any question — powered by Gemini 2.5 Flash.")
+api_key = get_api_key()
+if not api_key:
+    st.warning(
+        "No API key found. Set `GOOGLE_API_KEY` in a `.env` file, as an "
+        "environment variable, or in Streamlit secrets."
+    )
+    st.stop()
 
-# Question input
-question = st.text_input(
-    "Enter your question (e.g., 'What is the invoice number?')", key="question"
+uploaded_file = st.file_uploader("Upload invoice", type=["jpg", "jpeg", "png", "webp", "pdf"])
+mode = st.radio(
+    "What do you want?",
+    ("Ask a question", "Extract all fields as JSON"),
+    horizontal=True,
 )
+question = ""
+if mode == "Ask a question":
+    question = st.text_input("Your question", placeholder="What is the invoice number?")
 
-# File uploader
-uploaded_file = st.file_uploader("Upload invoice image", type=["jpg", "jpeg", "png"])
+if uploaded_file and uploaded_file.type != "application/pdf":
+    st.image(uploaded_file, caption="Uploaded invoice", use_container_width=True)
 
-# JSON extraction checkbox
-extract_json = st.checkbox("Structured JSON extraction (invoice fields)")
-
-# Process button
-if st.button("Extract Information"):
-    if uploaded_file and question.strip():
-        # Save uploaded image temporarily
-        temp_path = "temp_invoice_image.jpg"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        # Display uploaded image
-        image = Image.open(uploaded_file)
-        st.image(image, caption="Uploaded Invoice", use_column_width=True)
-
-        # Modify question for structured extraction if checkbox is checked
-        if extract_json:
-            question = f"""
-            Extract the following fields from this invoice:
-            - Invoice Number
-            - Date
-            - Vendor Name
-            - Total Amount
-            - Tax Amount
-            Return the answer in strict JSON format.
-            Original question: {question}
-            """
-
-        # Query Gemini
+if st.button("Extract Information", type="primary"):
+    extract_json = mode == "Extract all fields as JSON"
+    if not uploaded_file:
+        st.warning("Please upload an invoice first.")
+    elif not extract_json and not question.strip():
+        st.warning("Please enter a question.")
+    else:
+        prompt = EXTRACTION_PROMPT if extract_json else question.strip()
         with st.spinner("Analyzing invoice with Gemini..."):
             try:
-                answer = get_gemini_response(temp_path, question)
-                st.success("✅ Extracted Information:")
+                answer = ask_gemini(
+                    get_model(api_key),
+                    uploaded_file.getvalue(),
+                    uploaded_file.type or "image/jpeg",
+                    prompt,
+                    extract_json,
+                )
+            except Exception as error:
+                st.error(f"Error: {error}")
+                st.stop()
 
-                # Display JSON or text
-                if isinstance(answer, dict):
-                    st.json(answer)
-                else:
-                    st.write(answer)
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
+        st.success("Extracted information")
+        if extract_json:
+            try:
+                data = json.loads(answer)
+            except json.JSONDecodeError:
+                st.warning("The model did not return valid JSON. Raw reply:")
+                st.code(answer)
+            else:
+                st.json(data)
+                st.download_button(
+                    "Download JSON",
+                    json.dumps(data, indent=2),
+                    file_name="invoice.json",
+                    mime="application/json",
+                )
+        else:
+            st.write(answer)
 
-        # Clean up temporary file
-        os.remove(temp_path)
-    else:
-        st.warning("Please upload an image and enter a question first.")
-
-# Footer
 st.markdown("---")
-st.markdown("Built with ❤️ using Google Gemini API + Streamlit")
+st.caption("Built with the Google Gemini API and Streamlit. Always verify extracted amounts against the original document.")
