@@ -4,32 +4,22 @@ using Google Gemini's multimodal model."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 
-import google.generativeai as genai
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("invoice_extractor")
 
-EXTRACTION_PROMPT = """Extract the fields below from this invoice and return
-one JSON object with exactly these keys. Use null for anything that is not
-visible on the invoice. Amounts must be numbers without currency symbols.
-
-- invoice_number
-- invoice_date (YYYY-MM-DD when the date is unambiguous)
-- due_date
-- vendor_name
-- vendor_address
-- customer_name
-- currency (ISO code if it can be inferred)
-- subtotal
-- tax_amount
-- total_amount
-- line_items: list of {description, quantity, unit_price, amount}
-"""
+# Imported after load_dotenv() so .env values (GEMINI_MODEL, MAX_UPLOAD_MB, ...) apply.
+import extractor  # noqa: E402
 
 st.set_page_config(page_title="Invoice Extractor", page_icon="📄", layout="centered")
 
@@ -45,31 +35,11 @@ def get_api_key() -> str | None:
 
 @st.cache_resource
 def get_model(api_key: str):
-    genai.configure(api_key=api_key)
-    return genai.GenerativeModel(MODEL_NAME)
-
-
-def ask_gemini(model, image_bytes: bytes, mime_type: str, prompt: str, as_json: bool) -> str:
-    """Send the invoice and prompt to Gemini and return the text reply."""
-    config = {"max_output_tokens": 4096, "temperature": 0}
-    if as_json:
-        # Ask the API for JSON directly instead of parsing it out of prose.
-        config["response_mime_type"] = "application/json"
-
-    response = model.generate_content(
-        [prompt, {"mime_type": mime_type, "data": image_bytes}],
-        generation_config=config,
-    )
-    try:
-        return response.text.strip()
-    except ValueError:
-        # response.text raises when the reply was blocked or came back empty.
-        reason = getattr(response, "prompt_feedback", None)
-        raise RuntimeError(f"Gemini returned no text. {reason or ''}".strip())
+    return extractor.build_model(api_key)
 
 
 st.title("📄 Invoice Extractor")
-st.caption(f"Upload an invoice and ask about it. Powered by {MODEL_NAME}.")
+st.caption(f"Upload an invoice and ask about it. Powered by {extractor.MODEL_NAME}.")
 
 api_key = get_api_key()
 if not api_key:
@@ -99,28 +69,38 @@ if st.button("Extract Information", type="primary"):
     elif not extract_json and not question.strip():
         st.warning("Please enter a question.")
     else:
-        prompt = EXTRACTION_PROMPT if extract_json else question.strip()
+        file_bytes = uploaded_file.getvalue()
+        mime_type = uploaded_file.type or "image/jpeg"
+        try:
+            extractor.validate_upload(len(file_bytes), mime_type)
+        except ValueError as error:
+            st.error(str(error))
+            st.stop()
+
+        prompt = extractor.EXTRACTION_PROMPT if extract_json else question.strip()
         with st.spinner("Analyzing invoice with Gemini..."):
             try:
-                answer = ask_gemini(
-                    get_model(api_key),
-                    uploaded_file.getvalue(),
-                    uploaded_file.type or "image/jpeg",
-                    prompt,
-                    extract_json,
+                answer = extractor.ask_gemini(
+                    get_model(api_key), file_bytes, mime_type, prompt, extract_json
                 )
             except Exception as error:
+                logger.exception("Gemini request failed")
                 st.error(f"Error: {error}")
                 st.stop()
 
         st.success("Extracted information")
         if extract_json:
             try:
-                data = json.loads(answer)
-            except json.JSONDecodeError:
-                st.warning("The model did not return valid JSON. Raw reply:")
+                data, warnings = extractor.normalize_invoice(
+                    extractor.parse_json_reply(answer)
+                )
+            except (json.JSONDecodeError, extractor.ExtractionError):
+                logger.warning("Model reply was not a usable JSON object")
+                st.warning("The model did not return a valid invoice JSON object. Raw reply:")
                 st.code(answer)
             else:
+                for message in warnings:
+                    st.warning(f"Check against the original: {message}")
                 st.json(data)
                 st.download_button(
                     "Download JSON",
